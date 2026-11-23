@@ -1,54 +1,100 @@
-name: SILVETON ARRANGER Android ARM64 APK
+name: SILVETON ARRANGER - Android APK
 
+# Upload (replace) SILVETON-ARRANGER.zip in the root of main.
+# The ZIP is unpacked on the GitHub runner, NOT in the repository.
 on:
   push:
     branches: [main]
     paths:
       - 'SILVETON-ARRANGER.zip'
+      - '.github/workflows/SDF.yml'
   workflow_dispatch:
 
+# Releases need contents: write. Without it, the APK can build but cannot be published.
 permissions:
-  contents: read
+  contents: write
+
+# Do not publish older builds after newer ones when pushes arrive close together.
+concurrency:
+  group: silveton-arranger-apk-release
+  cancel-in-progress: false
 
 jobs:
   android-apk:
+    name: Build, verify and publish direct APK
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
       CI: 'true'
     steps:
-      - name: Get repository
+      - name: Checkout SDF repository
         uses: actions/checkout@v4
-      - name: Check uploaded source and unzip
+
+      - name: Unpack SILVETON-ARRANGER.zip automatically
         shell: bash
         run: |
           set -euo pipefail
-          test -s SILVETON-ARRANGER.zip || { echo 'MISSING: Upload SILVETON-ARRANGER.zip to repository root'; exit 1; }
-          unzip -t SILVETON-ARRANGER.zip
-          mkdir -p "$RUNNER_TEMP/arranger-source"
-          unzip -q SILVETON-ARRANGER.zip -d "$RUNNER_TEMP/arranger-source"
-          test -f "$RUNNER_TEMP/arranger-source/silveton_pro_payload/CMakeLists.txt"
-          test -f "$RUNNER_TEMP/arranger-source/silveton_pro_payload/android/app/build.gradle.kts"
-          echo "ARRANGER_SOURCE=$RUNNER_TEMP/arranger-source/silveton_pro_payload" >> "$GITHUB_ENV"
-          grep -E 'versionCode|versionName|applicationId' "$RUNNER_TEMP/arranger-source/silveton_pro_payload/android/app/build.gradle.kts"
-      - name: Java 17
+          test -s SILVETON-ARRANGER.zip || {
+            echo 'ERROR: Upload SILVETON-ARRANGER.zip to the repository root on main.' >&2
+            exit 1
+          }
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+          import os
+
+          dest = Path(os.environ['RUNNER_TEMP']) / 'arranger-source'
+          dest.mkdir(parents=True, exist_ok=True)
+          with ZipFile('SILVETON-ARRANGER.zip') as archive:
+              names = archive.namelist()
+              if not names:
+                  raise SystemExit('ERROR: The source ZIP is empty')
+              for name in names:
+                  p = PurePosixPath(name)
+                  if p.is_absolute() or '..' in p.parts or '\\' in name:
+                      raise SystemExit('ERROR: Unsafe ZIP path: ' + name)
+              bad = archive.testzip()
+              if bad:
+                  raise SystemExit('ERROR: Damaged ZIP entry: ' + bad)
+              archive.extractall(dest)
+          source = dest / 'silveton_pro_payload'
+          required = [
+              source / 'CMakeLists.txt',
+              source / 'android/app/build.gradle.kts',
+              source / 'core/CMakeLists.txt',
+              dest / 'scripts/check_android_package.py',
+          ]
+          for path in required:
+              if not path.is_file():
+                  raise SystemExit('ERROR: Required source file missing: ' + str(path))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('ARRANGER_SOURCE=' + str(source) + '\n')
+              output.write('ARRANGER_ROOT=' + str(dest) + '\n')
+          print('Unpacked and checked', len(names), 'ZIP entries')
+          PY
+
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - name: Android SDK
+
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-      - name: Gradle 8.9
+
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Android 35, Build Tools 35 and NDK 27
+
+      - name: Install SDK 35, NDK 27 and CMake
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --licenses >/dev/null <<<'y' || true
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
-      - name: Prepare existing signing identity if secrets are configured
+
+      - name: Configure APK signing (optional persistent release key)
         shell: bash
         env:
           KEYSTORE_B64: ${{ secrets.SILVETON_ANDROID_KEYSTORE_BASE64 }}
@@ -58,65 +104,108 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "$KEYSTORE_B64" || -n "$STORE_PASSWORD" || -n "$KEY_ALIAS" || -n "$KEY_PASSWORD" ]]; then
-            [[ -n "$KEYSTORE_B64" && -n "$STORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]] || { echo 'ERROR: All four release-signing secrets are required'; exit 1; }
-            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/silveton-panel-keystore.p12"
-            chmod 600 "$RUNNER_TEMP/silveton-panel-keystore.p12"
-            echo "SILVETON_ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/silveton-panel-keystore.p12" >> "$GITHUB_ENV"
+            [[ -n "$KEYSTORE_B64" && -n "$STORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]] || {
+              echo 'ERROR: Signing requires all four SILVETON_ANDROID secrets.' >&2
+              exit 1
+            }
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/silveton-release.keystore"
+            chmod 600 "$RUNNER_TEMP/silveton-release.keystore"
+            echo "SILVETON_ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/silveton-release.keystore" >> "$GITHUB_ENV"
             echo "SILVETON_ANDROID_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
             echo "SILVETON_ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
             echo "SILVETON_ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
-            echo 'Signing: configured release key (verify certificate before update)'
+            echo 'SIGNING_MODE=release' >> "$GITHUB_ENV"
+            echo 'Signing with persistent release key.'
           else
-            echo 'Signing: CI test key. The resulting APK may NOT update a previously signed install.'
+            echo 'SIGNING_MODE=ci-test' >> "$GITHUB_ENV"
+            echo 'WARNING: Using a temporary CI debug key. Later versions may NOT install over this APK.'
           fi
-      - name: Validate PCM, Drum Kit and sampler C++ regression tests
+
+      - name: Check PCM, Drum Kit and sampler regressions
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S "$ARRANGER_SOURCE/core" -B "$RUNNER_TEMP/silveton-core-tests" -DCMAKE_BUILD_TYPE=Release -DSILVETON_LIVE_BUILD_TESTS=ON
+          cmake -S "$ARRANGER_SOURCE/core" -B "$RUNNER_TEMP/silveton-core-tests" \
+            -DCMAKE_BUILD_TYPE=Release -DSILVETON_LIVE_BUILD_TESTS=ON
           cmake --build "$RUNNER_TEMP/silveton-core-tests" --parallel 2 --target \
             silveton_pa5x_sample_tests silveton_pa5x_drumkit_tests \
             silveton_pa5x_set_bank_tests silveton_sampler_tests
           ctest --test-dir "$RUNNER_TEMP/silveton-core-tests" --output-on-failure \
             -R '^silveton_(pa5x_sample|pa5x_drumkit|pa5x_set_bank|sampler)_tests$'
-      - name: Compile release ARM64 APK
+
+      - name: Compile Android ARM64 release APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$ARRANGER_SOURCE/android"
-          gradle --no-daemon --console=plain --max-workers=3 assembleRelease 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
-          APK="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -type f -print -quit)"
-          test -s "$APK"
-          mkdir -p "$GITHUB_WORKSPACE/artifact"
-          cp "$APK" "$GITHUB_WORKSPACE/artifact/SILVETON-ARRANGER-0.1.71-ARM64.apk"
-      - name: Validate APK identity, signature and alignment
+          gradle --no-daemon --console=plain --max-workers=3 assembleRelease 2>&1 \
+            | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          ORIGINAL_APK="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -s "$ORIGINAL_APK"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          # The download filename never changes. The app version is inside its manifest.
+          cp "$ORIGINAL_APK" "$GITHUB_WORKSPACE/output/SILVETON-ARRANGER.apk"
+
+      - name: Verify package, native code, signature and version
         shell: bash
         run: |
           set -euo pipefail
-          APK="$GITHUB_WORKSPACE/artifact/SILVETON-ARRANGER-0.1.71-ARM64.apk"
+          APK="$GITHUB_WORKSPACE/output/SILVETON-ARRANGER.apk"
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          "$BT/aapt" dump badging "$APK" | tee "$GITHUB_WORKSPACE/artifact/APK_BADGING.txt"
-          grep -q "package: name='com.silveton.arranger.panel'" "$GITHUB_WORKSPACE/artifact/APK_BADGING.txt"
-          grep -q "versionCode='68'" "$GITHUB_WORKSPACE/artifact/APK_BADGING.txt"
-          "$BT/zipalign" -c -P 16 -v 4 "$APK"
-          "$BT/apksigner" verify --verbose --print-certs "$APK" | tee "$GITHUB_WORKSPACE/artifact/APK_SIGNATURE.txt"
-          sha256sum "$APK" | tee "$GITHUB_WORKSPACE/artifact/APK_SHA256.txt"
-          python3 "$RUNNER_TEMP/arranger-source/scripts/check_android_package.py" "$APK" \
+          "$BT/aapt2" dump badging "$APK" > "$GITHUB_WORKSPACE/output/APK_BADGING.txt"
+          grep -q "package: name='com.silveton.arranger.panel'" "$GITHUB_WORKSPACE/output/APK_BADGING.txt"
+          python3 "$ARRANGER_ROOT/scripts/check_android_package.py" "$APK" \
             --build-tools "$BT" \
             --gradle-file "$ARRANGER_SOURCE/android/app/build.gradle.kts" \
-            --report "$GITHUB_WORKSPACE/artifact/APK_VERIFICATION.json"
-      - name: Upload APK and checks
-        if: success()
+            --report "$GITHUB_WORKSPACE/output/APK_VERIFICATION.json"
+          "$BT/apksigner" verify --verbose --print-certs "$APK" \
+            > "$GITHUB_WORKSPACE/output/APK_SIGNATURE.txt"
+          sha256sum "$APK" > "$GITHUB_WORKSPACE/output/SILVETON-ARRANGER.apk.sha256"
+          echo 'APK successfully verified.'
+
+      - name: Publish verified APK as direct-download GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="apk-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          APK="$GITHUB_WORKSPACE/output/SILVETON-ARRANGER.apk"
+          CHECKSUM="$GITHUB_WORKSPACE/output/SILVETON-ARRANGER.apk.sha256"
+          VERSION="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$ARRANGER_SOURCE/android/app/build.gradle.kts" | head -n 1)"
+          test -n "$VERSION"
+          gh release create "$TAG" "$APK" "$CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "SILVETON ARRANGER $VERSION (Android ARM64)" \
+            --notes "Automatic release built from SILVETON-ARRANGER.zip. Source commit: $GITHUB_SHA. APK verification passed. Signing: $SIGNING_MODE. Device playback tests have NOT been performed by GitHub Actions." \
+            --latest
+          DIRECT="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/SILVETON-ARRANGER.apk"
+          VERSIONED="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/SILVETON-ARRANGER.apk"
+          # Check an actual APK asset exists in the published release.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            --jq '.assets[] | select(.name == "SILVETON-ARRANGER.apk") | .browser_download_url' \
+            | grep -Fqx "$VERSIONED"
+          {
+            echo "## SILVETON ARRANGER $VERSION — Android APK"
+            echo ''
+            echo "[Download APK directly]($DIRECT)"
+            echo ''
+            echo "[Exact build APK]($VERSIONED)"
+            echo ''
+            echo "Signing mode: $SIGNING_MODE. A tablet audio/MIDI test is still required."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "DIRECT APK: $DIRECT"
+
+      - name: Keep build logs for troubleshooting
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SILVETON-ARRANGER-APK
-          path: artifact/*
-          if-no-files-found: error
-          retention-days: 14
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: SILVETON-ARRANGER-BUILD-LOG
-          path: gradle-build.log
+          name: SILVETON-ARRANGER-BUILD-REPORT
+          path: |
+            gradle-build.log
+            output/APK_BADGING.txt
+            output/APK_VERIFICATION.json
+            output/APK_SIGNATURE.txt
           if-no-files-found: ignore
+          retention-days: 14
