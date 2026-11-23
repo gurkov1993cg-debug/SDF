@@ -137,6 +137,19 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/silveton-core-tests" --output-on-failure \
             -R '^silveton_(pa5x_sample|pa5x_drumkit|pa5x_set_bank|sampler)_tests$'
 
+      # Compare all 10 HOME buttons with the original Pa5X v1.4 pane order.
+      # Touch-tests exercise actual renderer hit regions, player focus and FX navigation.
+      - name: Verify HOME panes, Drum Editor and touch navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$ARRANGER_SOURCE" -B "$RUNNER_TEMP/silveton-home-ui-tests" \
+            -DCMAKE_BUILD_TYPE=Release -DIMAK_BUILD_TESTS=ON
+          cmake --build "$RUNNER_TEMP/silveton-home-ui-tests" --parallel 2 --target \
+            silveton_pa5x_home_tabs_ui_tests silveton_arranger_chord_ui_tests silveton_drum_edit_ui_tests
+          ctest --test-dir "$RUNNER_TEMP/silveton-home-ui-tests" --output-on-failure \
+            -R '^(silveton_pa5x_home_tabs_ui_tests|silveton_arranger_chord_ui_tests|silveton_drum_edit_ui_tests)$'
+
       - name: Compile Android ARM64 release APK
         shell: bash
         run: |
