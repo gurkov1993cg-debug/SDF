@@ -79,8 +79,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # setup-android@v3 still tries to install obsolete `sdkmanager tools`.
+      # Google removed that package; v4 installs command-line tools and platform-tools.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
@@ -91,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null || true
+          # The v4 setup action already accepts the Android SDK licenses.
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
 
       - name: Configure APK signing (optional persistent release key)
