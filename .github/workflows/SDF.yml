@@ -1,6 +1,7 @@
 name: SILVETON ARRANGER - Android APK
 
 # Upload (replace) SILVETON-ARRANGER.zip in the root of main.
+# For the first upgrade to 0.1.90, replace this workflow and the ZIP in one commit.
 # The ZIP is unpacked on the GitHub runner, NOT in the repository.
 on:
   push:
@@ -98,6 +99,39 @@ jobs:
           # The v4 setup action already accepts the Android SDK licenses.
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
 
+      # Cache compiled objects, not completed APKs or test results. Every
+      # release still compiles/links against the current source and runs tests.
+      - name: Restore C++ compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/silveton-ccache
+          key: silveton-ccache-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu22-ndk27-${{ github.sha }}
+          restore-keys: |
+            silveton-ccache-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu22-ndk27-
+
+      - name: Configure native build cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ccache >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends ccache
+          fi
+          command -v ninja
+          export CCACHE_DIR="$HOME/.cache/silveton-ccache"
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size=1G
+          ccache --zero-stats
+          JOBS="$(nproc)"
+          if (( JOBS > 4 )); then JOBS=4; fi
+          {
+            echo "CCACHE_DIR=$CCACHE_DIR"
+            echo "CCACHE_BASEDIR=$RUNNER_TEMP"
+            echo 'CCACHE_COMPILERCHECK=content'
+            echo 'SILVETON_CCACHE=1'
+            echo "SILVETON_BUILD_JOBS=$JOBS"
+          } >> "$GITHUB_ENV"
+
       - name: Configure APK signing (optional persistent release key)
         shell: bash
         env:
@@ -125,29 +159,34 @@ jobs:
             echo 'WARNING: Using a temporary CI debug key. Later versions may NOT install over this APK.'
           fi
 
-      - name: Check PCM, Drum Kit and sampler regressions
+      # One top-level host build. The previous two independent CMake build
+      # directories compiled silveton_live_core twice from the same sources.
+      - name: Compile shared host regression targets once
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S "$ARRANGER_SOURCE/core" -B "$RUNNER_TEMP/silveton-core-tests" \
-            -DCMAKE_BUILD_TYPE=Release -DSILVETON_LIVE_BUILD_TESTS=ON
-          cmake --build "$RUNNER_TEMP/silveton-core-tests" --parallel 2 --target \
+          BUILD="$RUNNER_TEMP/silveton-host-tests"
+          cmake -S "$ARRANGER_SOURCE" -B "$BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DIMAK_BUILD_TESTS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build "$BUILD" --parallel "$SILVETON_BUILD_JOBS" --target \
             silveton_pa5x_sample_tests silveton_pa5x_drumkit_tests \
-            silveton_pa5x_set_bank_tests silveton_sampler_tests
-          ctest --test-dir "$RUNNER_TEMP/silveton-core-tests" --output-on-failure \
-            -R '^silveton_(pa5x_sample|pa5x_drumkit|pa5x_set_bank|sampler)_tests$'
+            silveton_pa5x_set_bank_tests silveton_sampler_tests \
+            silveton_layered_polyphony_tests \
+            silveton_pa5x_home_tabs_ui_tests silveton_arranger_chord_ui_tests silveton_drum_edit_ui_tests
 
-      # Compare all 10 HOME buttons with the original Pa5X v1.4 pane order.
-      # Touch-tests exercise actual renderer hit regions, player focus and FX navigation.
+      - name: Check PCM, Drum Kit, sampler and layered polyphony regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/silveton-host-tests" --output-on-failure \
+            -R '^silveton_(pa5x_sample|pa5x_drumkit|pa5x_set_bank|sampler|layered_polyphony)_tests$'
+
       - name: Verify HOME panes, Drum Editor and touch navigation
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S "$ARRANGER_SOURCE" -B "$RUNNER_TEMP/silveton-home-ui-tests" \
-            -DCMAKE_BUILD_TYPE=Release -DIMAK_BUILD_TESTS=ON
-          cmake --build "$RUNNER_TEMP/silveton-home-ui-tests" --parallel 2 --target \
-            silveton_pa5x_home_tabs_ui_tests silveton_arranger_chord_ui_tests silveton_drum_edit_ui_tests
-          ctest --test-dir "$RUNNER_TEMP/silveton-home-ui-tests" --output-on-failure \
+          ctest --test-dir "$RUNNER_TEMP/silveton-host-tests" --output-on-failure \
             -R '^(silveton_pa5x_home_tabs_ui_tests|silveton_arranger_chord_ui_tests|silveton_drum_edit_ui_tests)$'
 
       - name: Compile Android ARM64 release APK
@@ -213,6 +252,12 @@ jobs:
             echo "Signing mode: $SIGNING_MODE. A tablet audio/MIDI test is still required."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "DIRECT APK: $DIRECT"
+
+      - name: Report compiler cache statistics
+        if: always()
+        shell: bash
+        run: |
+          if command -v ccache >/dev/null; then ccache --show-stats; fi
 
       - name: Keep build logs for troubleshooting
         if: always()
